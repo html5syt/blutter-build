@@ -14,7 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         # 可同时跑多个标签；红桃视频 Dart 3.8.1
-        target: [yunhu-1.6.34]
+        target: [yunhu——dart3140]
 
     env:
       TARGET_DESC: ${{ matrix.target }}
