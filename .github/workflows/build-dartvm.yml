@@ -29,9 +29,12 @@ jobs:
       - uses: ./.github/actions/setup-blutter
       - name: Detect version and build Dart VM + blutter (without analysis)
         id: build
+        shell: bash
         run: |
+          set -euo pipefail
+          mkdir -p out
           python3 scripts/blutter_ci.py build --target "$TARGET" --dart-version "$DART_VERSION" \
-            --output-json out/dart-info.json
+            --output-json out/dart-info.json 2>&1 | tee out/blutter.log
       - name: Upload versioned build artifacts
         uses: actions/upload-artifact@v6
         with:
@@ -41,3 +44,10 @@ jobs:
             blutter/packages/
             out/dart-info.json
           if-no-files-found: error
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: blutter-build-debug
+          path: out/
+          if-no-files-found: warn

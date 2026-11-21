@@ -24,10 +24,21 @@ jobs:
       - name: Detect Dart version from target libraries
         run: python3 scripts/blutter_ci.py detect --target "$TARGET" --output-json "out/$TARGET/dart-info.json"
       - name: Build and analyze libapp.so
-        run: python3 scripts/blutter_ci.py analyze --target "$TARGET"
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/blutter_ci.py analyze --target "$TARGET" 2>&1 | tee "out/$TARGET/blutter.log"
+          python3 scripts/test_native_types.py --target "$TARGET" 2>&1 | tee -a "out/$TARGET/blutter.log"
       - name: Upload analysis results
         uses: actions/upload-artifact@v6
         with:
           name: blutter-out-${{ inputs.target }}
           path: out/${{ inputs.target }}/
           if-no-files-found: error
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: blutter-debug-${{ inputs.target }}
+          path: out/
+          if-no-files-found: warn

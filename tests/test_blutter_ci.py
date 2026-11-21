@@ -1,3 +1,4 @@
+import io
 import json
 import os
 from pathlib import Path
@@ -56,14 +57,18 @@ class TargetTests(unittest.TestCase):
         self.assertIn("dart_version=3.14.0\n", output.read_text())
 
     def test_auto_build_requires_target_before_importing_blutter(self):
-        with self.assertRaises(SystemExit) as error:
-            ci.main(["build"])
+        with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            with self.assertRaises(SystemExit) as error:
+                ci.main(["build"])
         self.assertEqual(error.exception.code, 2)
+        self.assertIn("--target is required", stderr.getvalue())
 
     def test_manual_build_rejects_invalid_version(self):
-        with self.assertRaises(SystemExit) as error:
-            ci.main(["build", "--dart-version", '3.14.0\nmalicious=true'])
+        with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            with self.assertRaises(SystemExit) as error:
+                ci.main(["build", "--dart-version", '3.14.0\nmalicious=true'])
         self.assertEqual(error.exception.code, 2)
+        self.assertIn("--dart-version must be", stderr.getvalue())
 
 
 class BuildTests(unittest.TestCase):
@@ -93,6 +98,68 @@ class BuildTests(unittest.TestCase):
             with patch.object(ci, "load_blutter", return_value=fake), patch.dict(sys.modules, {"dartvm_fetch_build": SimpleNamespace(fetch_and_build=Mock())}):
                 with self.assertRaisesRegex(RuntimeError, "without binary"):
                     ci.build_only(SimpleNamespace(lib_name="test"), root)
+
+
+class AnalysisOutputTests(unittest.TestCase):
+    def test_metadata_alone_is_not_a_successful_analysis(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "dart-info.json").write_text("{}")
+            with self.assertRaisesRegex(RuntimeError, "Incomplete.*pp.txt"):
+                ci.validate_analysis_output(root)
+
+    def test_empty_output_files_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in ("pp.txt", "objs.txt", "blutter_frida.js",
+                         "ida_script/addNames.py", "ida_script/ida_dart_struct.h"):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            (root / "asm").mkdir()
+            with self.assertRaisesRegex(RuntimeError, "Incomplete"):
+                ci.validate_analysis_output(root)
+
+    def test_complete_analysis_includes_ida_symbol_import(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in ("pp.txt", "objs.txt", "blutter_frida.js",
+                         "ida_script/addNames.py", "ida_script/ida_dart_struct.h", "asm/app.dart"):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("generated output")
+            ci.validate_analysis_output(root)
+
+
+class NoBuildTests(unittest.TestCase):
+    def test_missing_binary_does_not_trigger_compilation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            item = SimpleNamespace(blutter_file=str(root / "missing"))
+            blutter = SimpleNamespace(BlutterInput=Mock(return_value=item), build_and_run=Mock())
+            with patch.object(ci, "detect_metadata", return_value={}), \
+                 patch.object(ci, "dart_info", return_value=object()), \
+                 patch.object(ci, "load_blutter", return_value=blutter), \
+                 patch.object(ci, "target_directory", return_value=root):
+                with self.assertRaisesRegex(RuntimeError, "No prebuilt binary"):
+                    ci.main(["analyze", "--target", "test", "--no-build", "--out-dir", str(root)])
+            blutter.build_and_run.assert_not_called()
+
+    def test_existing_binary_is_reused(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            executable = root / "existing"
+            executable.touch()
+            item = SimpleNamespace(blutter_file=str(executable))
+            blutter = SimpleNamespace(BlutterInput=Mock(return_value=item), build_and_run=Mock())
+            with patch.object(ci, "detect_metadata", return_value={}), \
+                 patch.object(ci, "dart_info", return_value=object()), \
+                 patch.object(ci, "load_blutter", return_value=blutter), \
+                 patch.object(ci, "target_directory", return_value=root), \
+                 patch.object(ci, "validate_analysis_output") as validate:
+                ci.main(["analyze", "--target", "test", "--no-build", "--out-dir", str(root)])
+            blutter.build_and_run.assert_called_once_with(item)
+            validate.assert_called_once_with(root.resolve())
 
 
 if __name__ == "__main__":

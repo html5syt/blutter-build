@@ -22,10 +22,62 @@ index dc12556..abaa355 100644
          # derive blutter executable filename
          self.blutter_name = f'blutter_{dart_info.lib_name}{self.name_suffix}'
 diff --git a/blutter/src/DartApp.cpp b/blutter/src/DartApp.cpp
-index 25ad347..0c5f85b 100644
+index 25ad347..034d69e 100644
 --- a/blutter/src/DartApp.cpp
 +++ b/blutter/src/DartApp.cpp
-@@ -299,6 +299,7 @@ void DartApp::loadStubs(dart::ObjectStore* store)
+@@ -7,12 +7,24 @@ PRAGMA_WARNING(push, 0)
+ #include <vm/heap/safepoint.h>
+ PRAGMA_WARNING(pop)
+ #include <format>
++#include <filesystem>
+ #include <iostream> // for debugging purpose
+ 
++static uintptr_t function_entry_point(const dart::Function& function) {
++#if defined(kSnapshotDataAsmSymbol)
++	if (DartFnBase::IsInLib(function.entry_point())) return function.entry_point();
++	const auto& code = dart::Code::Handle(function.CurrentCode());
++	return code.IsNull() ? 0 : code.EntryPoint();
++#else
++	return function.entry_point();
++#endif
++}
++
+ DartApp::DartApp(const char* path) : ppool(NULL), nativeLib(0xdeadead), throwStubAddr(0)
+ {
+ 	auto libInfo = ElfHelper::MapLibAppSo(path);
+ 	lib_base = libInfo.lib;
++	lib_file_size_ = std::filesystem::file_size(path);
+ 	vm_snapshot_data = libInfo.vm_snapshot_data;
+ 	vm_snapshot_instructions = libInfo.vm_snapshot_instructions;
+ 	isolate_snapshot_data = libInfo.isolate_snapshot_data;
+@@ -23,7 +35,7 @@ DartApp::DartApp(const char* path) : ppool(NULL), nativeLib(0xdeadead), throwStu
+ 	heap_base_ = dart::Thread::Current()->heap_base();
+ 	inScope = false;
+ 
+-	DartFnBase::SetLibBase(base());
++	DartFnBase::SetLibBase(base(), lib_file_size_);
+ 
+ 	dartIntCid = 0;
+ 	dartDoubleCid = 0;
+@@ -154,7 +166,6 @@ DartLibrary* DartApp::addLibrary(const dart::Library& library)
+ void DartApp::LoadInfo()
+ {
+ 	auto ig = dart::Isolate::Current()->group();
+-
+ 	loadFromClassTable(ig);
+ 
+ 	auto store = ig->object_store();
+@@ -165,9 +176,7 @@ void DartApp::LoadInfo()
+ 	// getting hidden functions from InstructionsTable are not compatible against old Dart version
+ 	// find all Code object in heap is a work around for getting all functions
+ 	findFunctionInHeap();
+-
+ 	loadFromObjectPool();
+-
+ 	finalizeFunctionsInfo();
+ 
+ 	//auto fieldTable = isolate->field_table(); //contains only sentinel, null, false, 0
+@@ -299,6 +308,7 @@ void DartApp::loadStubs(dart::ObjectStore* store)
  	uint64_t ep_addr;
  	DartStub* stub;
  
@@ -33,7 +85,7 @@ index 25ad347..0c5f85b 100644
  	// Note: some stub might contain multiple of duplicated stubs
  	// these stubs are called "_iso_stub_" in runtime/vm/stub_code.cc
  #define DO(member, name) \
-@@ -321,6 +322,9 @@ void DartApp::loadStubs(dart::ObjectStore* store)
+@@ -321,6 +331,9 @@ void DartApp::loadStubs(dart::ObjectStore* store)
  	// load VM stub code
  	// the dart entry point "static void main()" is a LazyCompileVMStub which call "main" stub (a real main)
  	ASSERT(dart::StubCode::HasBeenInitialized());
@@ -43,6 +95,207 @@ index 25ad347..0c5f85b 100644
  #define DO(name) {\
  		const auto& code = dart::StubCode::name(); \
  		ep_addr = code.EntryPoint() - base(); \
+@@ -370,6 +383,11 @@ DartFunction* DartApp::addFunctionNoCheck(const dart::Function& func)
+ 
+ void DartApp::addFunction(uintptr_t ep_addr, const dart::Function& func)
+ {
++#if defined(kSnapshotDataAsmSymbol)
++	const auto entry = function_entry_point(func);
++	if (entry == 0) return;
++	ep_addr = entry - base();
++#endif
+ 	if (!functions.contains(ep_addr)) {
+ 		auto dartFn = addFunctionNoCheck(func);
+ 		functions[dartFn->Address()] = dartFn;
+@@ -517,7 +535,9 @@ void DartApp::finalizeFunctionsInfo()
+ 		// update parent pointer
+ 		if (dartFn->parent) {
+ 			parentFn = dart::FunctionPtr((intptr_t)dartFn->parent);
+-			const auto ep_addr = parentFn.entry_point() - base();
++			const auto parent_entry = function_entry_point(parentFn);
++			if (parent_entry == 0) { dartFn->parent = nullptr; continue; }
++			const auto ep_addr = parent_entry - base();
+ 			if (stubs.contains(ep_addr)) {
+ 				dartFn->parent = nullptr;
+ 			}
+@@ -542,7 +562,13 @@ void DartApp::finalizeFunctionsInfo()
+ 		for (auto& [dartFn_ep, dartFn] : pending_functions) {
+ 			if (dartFn->parent) {
+ 				parentFn = dart::FunctionPtr((intptr_t)dartFn->parent);
+-				const auto ep_addr = parentFn.entry_point() - base();
++				const auto parent_entry = function_entry_point(parentFn);
++				if (parent_entry == 0) {
++					dartFn->parent = nullptr;
++					functions[dartFn_ep] = dartFn;
++					continue;
++				}
++				const auto ep_addr = parent_entry - base();
+ 				if (stubs.contains(ep_addr)) {
+ 					dartFn->parent = nullptr;
+ 				}
+diff --git a/blutter/src/DartApp.h b/blutter/src/DartApp.h
+index a61081d..a88e268 100644
+--- a/blutter/src/DartApp.h
++++ b/blutter/src/DartApp.h
+@@ -20,6 +20,11 @@ public:
+ 	intptr_t base() const { return (intptr_t)lib_base; }
+ 	uint32_t offset(intptr_t addr) const { return (uint32_t)(addr - base()); }
+ 	uintptr_t heap_base() const { return heap_base_; }
++	bool HasMappedAddress(uint64_t address) const { return address > 0 && address < lib_file_size_; }
++	bool HasMappedCode(const DartFnBase& function) const {
++		return function.Size() > 0 && function.Address() < lib_file_size_ &&
++			(uint64_t)function.Size() <= lib_file_size_ - function.Address();
++	}
+ 
+ 	DartClass* GetClass(intptr_t cid);
+ 	DartFnBase* GetFunction(uint64_t addr);
+@@ -44,6 +49,7 @@ private:
+ 	void walkObject(dart::Object& obj); // to check field types from existed object
+ 
+ 	const void* lib_base;
++	uint64_t lib_file_size_;
+ 	const uint8_t* vm_snapshot_data;
+ 	const uint8_t* vm_snapshot_instructions;
+ 	const uint8_t* isolate_snapshot_data;
+diff --git a/blutter/src/DartDumper.cpp b/blutter/src/DartDumper.cpp
+index 85bde37..b20144b 100644
+--- a/blutter/src/DartDumper.cpp
++++ b/blutter/src/DartDumper.cpp
+@@ -94,20 +94,23 @@ void DartDumper::Dump4Ida(std::filesystem::path outDir)
+ 		for (auto cls : lib->classes) {
+ 			std::string cls_prefix = cls->Name();
+ 			for (auto dartFn : cls->Functions()) {
++				if (!app.HasMappedAddress(dartFn->Address())) continue;
+ 				const auto ep = dartFn->Address();
+ 				auto name = getFunctionName4Ida(*dartFn, cls_prefix);
+ 				const auto fnSize = dartFn->Size();
+-				if (fnSize > 0) {
++				if (app.HasMappedCode(*dartFn)) {
+ 					of << std::format("ida_funcs.add_func({:#x}, {:#x})\n", ep, ep + fnSize);
++				} else {
++					of << std::format("ida_funcs.add_func({:#x})  # discarded Code: infer the end\n", ep);
+ 				}
+ 				of << std::format("idaapi.set_name({:#x}, \"{}_{}::{}_{:x}\")\n", ep, lib_prefix, cls_prefix, name.c_str(), ep);
+ 				if (dartFn->HasMorphicCode()) {
+ 					const auto payloadAddr = dartFn->PayloadAddress();
+ 					const auto morphicAddr = dartFn->MonomorphicAddress();
+-					if (payloadAddr != 0 && payloadAddr != ep) {
++					if (payloadAddr != 0 && payloadAddr != ep && payloadAddr < app.lib_file_size_) {
+ 						of << std::format("idaapi.set_name({:#x}, \"{}_{}::{}_{:x}_miss\")\n", payloadAddr, lib_prefix, cls_prefix, name.c_str(), ep);
+ 					}
+-					if (morphicAddr != 0 && morphicAddr != ep && morphicAddr != payloadAddr) {
++					if (morphicAddr != 0 && morphicAddr != ep && morphicAddr != payloadAddr && morphicAddr < app.lib_file_size_) {
+ 						of << std::format("idaapi.set_name({:#x}, \"{}_{}::{}_{:x}_check\")\n", morphicAddr, lib_prefix, cls_prefix, name.c_str(), ep);
+ 					}
+ 				}
+@@ -117,6 +120,7 @@ void DartDumper::Dump4Ida(std::filesystem::path outDir)
+ 
+ 	for (auto& item : app.stubs) {
+ 		auto stub = item.second;
++		if (!app.HasMappedCode(*stub)) continue;
+ 		const auto ep = stub->Address();
+ 		auto name = stub->FullName();
+ 		std::replace(name.begin(), name.end(), '<', '@');
+@@ -255,10 +259,10 @@ void DartDumper::applyStruct4Ida(std::ostream& of)
+ 
+ 		for (auto dartCls : lib->classes) {
+ 			for (auto dartFn : dartCls->Functions()) {
+-				if (dartFn->PayloadSize() == 0)
++				if (!app.HasMappedCode(*dartFn))
+ 					continue;
+ 
+-				auto insns = disasmer.Disasm((uint8_t*)dartFn->PayloadAddress() + app.base(), dartFn->PayloadSize(), dartFn->Address());
++				auto insns = disasmer.Disasm((const uint8_t*)dartFn->MemAddress(), dartFn->Size(), dartFn->Address());
+ 
+ 				for (uint32_t i = 0; i < insns.Count(); i++) {
+ 					auto insn = insns.At(i);
+@@ -390,6 +394,14 @@ void DartDumper::DumpCode(const char* out_dir)
+ 							of << std::format("{:#x}: {}  ; {}\n", asmText.addr, &asmText.text[0], extra);
+ 					}
+ 				}
++#else
++				if (app.HasMappedCode(*dartFn)) {
++					auto instructions = disasmer.Disasm((const uint8_t*)dartFn->MemAddress(), dartFn->Size(), dartFn->Address());
++					for (size_t i = 0; i < instructions.Count(); ++i) {
++						const auto* insn = instructions.Ptr(i);
++						of << std::format("    // {:#x}: {} {}\n", insn->address, insn->mnemonic, insn->op_str);
++					}
++				}
+ #endif // NO_CODE_ANALYSIS
+ 
+ 				dartFn->PrintFoot(of);
+diff --git a/blutter/src/DartFnBase.h b/blutter/src/DartFnBase.h
+index 5ec278a..ce8db8d 100644
+--- a/blutter/src/DartFnBase.h
++++ b/blutter/src/DartFnBase.h
+@@ -12,7 +12,10 @@ public:
+ 	// For setting current library loaded address
+ 	// because the Dart code and global data are independent (access through Object Pool)
+ 	// so we can set a code address to be as if the library is loaded at 0 (to be same for every run)
+-	static void SetLibBase(intptr_t addr) { lib_base = addr; }
++	static void SetLibBase(intptr_t addr, uint64_t size = 0) { lib_base = addr; lib_size = size; }
++	static bool IsInLib(uintptr_t address) {
++		return address >= (uintptr_t)lib_base && address - (uintptr_t)lib_base < lib_size;
++	}
+ 
+ 	DartFnBase(const DartFnBase&) = default;
+ 	DartFnBase(DartFnBase&&) = delete;
+@@ -43,4 +46,5 @@ protected:
+ 	std::string name;
+ 
+ 	static intptr_t lib_base;
++	static uint64_t lib_size;
+ };
+\ No newline at end of file
+diff --git a/blutter/src/DartFunction.cpp b/blutter/src/DartFunction.cpp
+index 16067d7..4022bc1 100644
+--- a/blutter/src/DartFunction.cpp
++++ b/blutter/src/DartFunction.cpp
+@@ -10,6 +10,7 @@
+ 
+ // place static member because no DartFnBase source file
+ intptr_t DartFnBase::lib_base;
++uint64_t DartFnBase::lib_size;
+ 
+ DartFunction::DartFunction(DartClass& cls, const dart::FunctionPtr ptr) : DartFnBase(), cls(cls), parent(nullptr), ptr(ptr), kind(NORMAL)
+ {
+@@ -70,6 +71,13 @@ DartFunction::DartFunction(DartClass& cls, const dart::FunctionPtr ptr) : DartFn
+ 	// Code.EntryPoint() in obfuscated app might be pointed at start of snapshot (wrong)
+ 	const auto ep = func.entry_point() - lib_base;
+ 	const auto& code = dart::Code::Handle(zone, func.CurrentCode());
++	if (code.IsNull()) {
++		// Optimized-out closures can retain metadata without executable code.
++		ep_addr = IsInLib(func.entry_point()) ? func.entry_point() - lib_base : 0;
++		payload_addr = morphic_addr = ep_addr;
++		size = 0;
++		return;
++	}
+ 	payload_addr = code.PayloadStart();
+ 	if (payload_addr > 0)
+ 		payload_addr -= lib_base;
+@@ -78,10 +86,21 @@ DartFunction::DartFunction(DartClass& cls, const dart::FunctionPtr ptr) : DartFn
+ 		morphic_addr -= lib_base;
+ 	size = code.Size();
+ 	ep_addr = code.EntryPoint() - lib_base;
++#if defined(kSnapshotDataAsmSymbol)
++	if (IsInLib(func.entry_point())) {
++		ep_addr = ep;
++		// Discarded Code objects have no trustworthy body size. Keep their
++		// names/addresses, but let IDA infer function boundaries instead.
++		if (ep_addr < payload_addr || ep_addr - payload_addr >= (uint64_t)size) {
++			payload_addr = morphic_addr = ep_addr;
++			size = 0;
++		}
++	}
++#else
+ 	if (ep != ep_addr) {
+ 		ep_addr = ep;
+-		//std::cout << std::format("Fn: {}, payload: {:#x}, ep_addr: {:#x}, ep: {:#x}\n", name.c_str(), payload_addr, ep_addr, ep);
+ 	}
++#endif
+ 
+ 	//if (ep_addr != payload_addr) {
+ 	//	std::cout << std::format("Fn: {}, payload: {:#x}, morphic: {:#x}, ep: {:#x}\n", name.c_str(), payload_addr, morphic_addr, ep_addr);
 diff --git a/blutter/src/DartLoader.cpp b/blutter/src/DartLoader.cpp
 index b938219..72fe3d6 100644
 --- a/blutter/src/DartLoader.cpp
@@ -93,6 +346,67 @@ index f932cbc..a4ca98e 100644
  		BuildNonGenericMethodExtractorStub,
  		BuildGenericMethodExtractorStub,
  #define DO(name) name ## VMStub,
+diff --git a/blutter/src/DartTypes.cpp b/blutter/src/DartTypes.cpp
+index 9482811..56387b9 100644
+--- a/blutter/src/DartTypes.cpp
++++ b/blutter/src/DartTypes.cpp
+@@ -3,6 +3,7 @@
+ #include "DartClass.h"
+ #include <numeric>
+ #include <sstream>
++#include <stdexcept>
+ 
+ const DartTypeArguments DartTypeArguments::Null;
+ 
+@@ -308,6 +309,11 @@ DartFunctionType* DartTypeDb::FindOrAdd(dart::FunctionTypePtr fnTypePtr)
+ DartAbstractType* DartTypeDb::FindOrAdd(dart::AbstractTypePtr abTypePtr)
+ {
+ 	switch (abTypePtr.GetClassId()) {
++	case dart::kNullCid: {
++		// Missing AOT signature/type-argument metadata is not an invalid type.
++		static DartOptimizedOutType optimized_out;
++		return &optimized_out;
++	}
+ 	case dart::kTypeCid:
+ 		return FindOrAdd(dart::Type::RawCast(abTypePtr));
+ #ifdef HAS_RECORD_TYPE
+@@ -326,8 +332,7 @@ DartAbstractType* DartTypeDb::FindOrAdd(dart::AbstractTypePtr abTypePtr)
+ 	case dart::kFunctionTypeCid:
+ 		return FindOrAdd(dart::FunctionType::RawCast(abTypePtr));
+ 	}
+-	//return nullptr;
+-	FATAL("Invalid abstract type");
++	throw std::runtime_error(std::format("Invalid abstract type (class id {})", abTypePtr.GetClassId()));
+ }
+ 
+ const DartTypeArguments* DartTypeDb::FindOrAdd(dart::TypeArgumentsPtr typeArgsPtr)
+diff --git a/blutter/src/DartTypes.h b/blutter/src/DartTypes.h
+index 6c025c3..598cfb3 100644
+--- a/blutter/src/DartTypes.h
++++ b/blutter/src/DartTypes.h
+@@ -27,6 +27,7 @@ public:
+ 		TypeRef,  // it is ref to Type, use it when self reference
+ #endif
+ 		FunctionType,
++		OptimizedOut,
+ 	};
+ 
+ 	explicit DartAbstractType(Kind kind, bool nullable) : kind(kind), nullable(nullable) {}
+@@ -69,6 +70,14 @@ protected:
+ 	bool nullable;
+ };
+ 
++// AOT snapshots may omit a type without changing the function's name/address.
++// Keep missing metadata distinct from a real Dart dynamic type.
++class DartOptimizedOutType final : public DartAbstractType {
++public:
++	DartOptimizedOutType() : DartAbstractType(Kind::OptimizedOut, false) {}
++	std::string ToString() const override { return "<optimized-out>"; }
++};
++
+ class DartTypeArguments {
+ public:
+ 	explicit DartTypeArguments(std::vector<DartAbstractType*> args) : args(std::move(args)) {}
 diff --git a/blutter/src/ElfHelper.cpp b/blutter/src/ElfHelper.cpp
 index 030c0a2..b07a7ab 100644
 --- a/blutter/src/ElfHelper.cpp
@@ -182,6 +496,18 @@ index 405f9c6..0f4be96 100644
  				of << "epOffset:" << AOT_Closure_entry_point_offset << "},\n";
  				break;
  			case dart::kTypedDataUint8ArrayCid:
+diff --git a/blutter/src/main.cpp b/blutter/src/main.cpp
+index 6aa46fd..d76fd0e 100644
+--- a/blutter/src/main.cpp
++++ b/blutter/src/main.cpp
+@@ -75,6 +75,7 @@ int main(int argc, char** argv)
+ 	}
+ 	catch (std::exception& e) {
+ 		std::cerr << "exception: " << e.what() << "\n";
++		return 1;
+ 	}
+ 
+ 	return 0;
 diff --git a/extract_dart_info.py b/extract_dart_info.py
 index 60e4cf2..d8f55ca 100644
 --- a/extract_dart_info.py

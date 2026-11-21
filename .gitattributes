@@ -1,0 +1,2 @@
+# Unified diff context intentionally contains leading spaces and tabs.
+*.patch text eol=lf -whitespace

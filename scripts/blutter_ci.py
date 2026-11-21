@@ -115,6 +115,22 @@ def build_only(info, blutter_dir, no_analysis=False):
     print(f"Built {build_input.blutter_file}", flush=True)
 
 
+def validate_analysis_output(outdir):
+    """A zero exit code alone is not proof that native analysis completed."""
+    outdir = Path(outdir)
+    required = ("pp.txt", "objs.txt", "blutter_frida.js",
+                "ida_script/addNames.py", "ida_script/ida_dart_struct.h")
+    missing = [name for name in required
+               if not (outdir / name).is_file() or (outdir / name).stat().st_size == 0]
+    asm = outdir / "asm"
+    if not asm.is_dir() or not any(path.is_file() and path.stat().st_size > 0
+                                  for path in asm.rglob("*")):
+        missing.append("asm/ (nonempty function dumps)")
+    if missing:
+        raise RuntimeError("Incomplete blutter analysis output: " + ", ".join(missing))
+    print("Validated object, function, Frida and IDA outputs", flush=True)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("discover", "patch", "detect", "analyze", "build"))
@@ -123,7 +139,11 @@ def main(argv=None):
     parser.add_argument("--dart-version", default="auto")
     parser.add_argument("--output-json", type=Path)
     parser.add_argument("--out-dir", type=Path)
+    parser.add_argument("--no-build", action="store_true",
+                        help="Analyze only with an existing binary; never download or compile a Dart SDK")
     args = parser.parse_args(argv)
+    if args.no_build and args.command != "analyze":
+        parser.error("--no-build is only valid with analyze")
     if args.command == "discover":
         print(json.dumps(discover_targets(), ensure_ascii=False))
         return
@@ -153,7 +173,12 @@ def main(argv=None):
         outdir.mkdir(parents=True, exist_ok=True)
         build_input = blutter.BlutterInput(str(directory / "libapp.so"), info,
                                           str(outdir), False, False, False)
+        if args.no_build and not Path(build_input.blutter_file).is_file():
+            raise RuntimeError(f"No prebuilt binary: {build_input.blutter_file}. "
+                               f"Run blutter_ci.py build --target {args.target} first.")
+        print(f"Using blutter binary: {build_input.blutter_file}", flush=True)
         blutter.build_and_run(build_input)
+        validate_analysis_output(outdir)
 
 
 if __name__ == "__main__":
