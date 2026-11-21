@@ -1,0 +1,264 @@
+diff --git a/blutter.py b/blutter.py
+index dc12556..abaa355 100644
+--- a/blutter.py
++++ b/blutter.py
+@@ -34,13 +34,17 @@ class BlutterInput:
+             if not no_analysis:
+                 print('Dart version <2.15, force "no-analysis" option')
+             no_analysis = True
++        if tuple(map(int, vers[:2])) >= (3, 14):
++            if not no_analysis:
++                print('Dart 3.14+ uses variable-sized closures; disabling unsupported code analysis. Assembly and object dumps are still generated.')
++            no_analysis = True
+         self.no_analysis = no_analysis
+ 
+         # Note: null-safety is detected in blutter application, so no need another build of blutter for null-safety
+         self.name_suffix = ''
+         if not dart_info.has_compressed_ptrs:
+             self.name_suffix += '_no-compressed-ptrs'
+-        if no_analysis:
++        if self.no_analysis:
+             self.name_suffix += '_no-analysis'
+         # derive blutter executable filename
+         self.blutter_name = f'blutter_{dart_info.lib_name}{self.name_suffix}'
+diff --git a/blutter/src/DartApp.cpp b/blutter/src/DartApp.cpp
+index 25ad347..0c5f85b 100644
+--- a/blutter/src/DartApp.cpp
++++ b/blutter/src/DartApp.cpp
+@@ -299,6 +299,7 @@ void DartApp::loadStubs(dart::ObjectStore* store)
+ 	uint64_t ep_addr;
+ 	DartStub* stub;
+ 
++#if defined(OBJECT_STORE_STUB_CODE_LIST)
+ 	// Note: some stub might contain multiple of duplicated stubs
+ 	// these stubs are called "_iso_stub_" in runtime/vm/stub_code.cc
+ #define DO(member, name) \
+@@ -321,6 +322,9 @@ void DartApp::loadStubs(dart::ObjectStore* store)
+ 	// load VM stub code
+ 	// the dart entry point "static void main()" is a LazyCompileVMStub which call "main" stub (a real main)
+ 	ASSERT(dart::StubCode::HasBeenInitialized());
++#else
++	throwStubAddr = dart::StubCode::Throw().EntryPoint();
++#endif
+ #define DO(name) {\
+ 		const auto& code = dart::StubCode::name(); \
+ 		ep_addr = code.EntryPoint() - base(); \
+diff --git a/blutter/src/DartLoader.cpp b/blutter/src/DartLoader.cpp
+index b938219..72fe3d6 100644
+--- a/blutter/src/DartLoader.cpp
++++ b/blutter/src/DartLoader.cpp
+@@ -7,6 +7,10 @@
+ 
+ static void init_vm_flags()
+ {
++#if defined(kSnapshotDataAsmSymbol)
++	// Initialize the flag registry without the removed --precompilation flag.
++	char* error = Dart_SetVMFlags(0, nullptr);
++#else
+ 	// From flutter/engine/runtime/dart_vm.cc
+ 	const char* options[] = {
+ 		//"--ignore-unrecognized-flags",
+@@ -14,6 +18,7 @@ static void init_vm_flags()
+ 		"--precompilation",
+ 	};
+ 	char* error = Dart_SetVMFlags(sizeof(options) / sizeof(*options), options);
++#endif
+ 	if (error)
+ 		throw std::runtime_error(error);
+ }
+@@ -25,8 +30,10 @@ static void init_dart(const uint8_t* vm_snapshot_data, const uint8_t* vm_snapsho
+ 	Dart_InitializeParams init_params;
+ 	memset(&init_params, 0, sizeof(init_params));
+ 	init_params.version = DART_INITIALIZE_PARAMS_CURRENT_VERSION;
++#if !defined(kSnapshotDataAsmSymbol)
+ 	init_params.vm_snapshot_data = vm_snapshot_data;
+ 	init_params.vm_snapshot_instructions = vm_snapshot_instructions;
++#endif
+ 	init_params.start_kernel_isolate = false;
+ 	// other params are no needed if snapshot is not run
+ 	error = Dart_Initialize(&init_params);
+diff --git a/blutter/src/DartStub.h b/blutter/src/DartStub.h
+index f932cbc..a4ca98e 100644
+--- a/blutter/src/DartStub.h
++++ b/blutter/src/DartStub.h
+@@ -10,9 +10,11 @@ class DartStub : public DartFnBase
+ {
+ public:
+ 	enum Kind : int32_t {
++#if defined(OBJECT_STORE_STUB_CODE_LIST)
+ #define DO(member, name) name ## Stub,
+ 		OBJECT_STORE_STUB_CODE_LIST(DO)
+ #undef DO
++#endif
+ 		BuildNonGenericMethodExtractorStub,
+ 		BuildGenericMethodExtractorStub,
+ #define DO(name) name ## VMStub,
+diff --git a/blutter/src/ElfHelper.cpp b/blutter/src/ElfHelper.cpp
+index 030c0a2..b07a7ab 100644
+--- a/blutter/src/ElfHelper.cpp
++++ b/blutter/src/ElfHelper.cpp
+@@ -86,8 +86,12 @@ LibAppInfo ElfHelper::findSnapshots(const uint8_t* elf)
+ 			// we want only .dynstr for .dynsym
+ 			const char* strtab = (const char*)elf + section->file_offset;
+ 			const char* last = strtab + section->file_size;
++#if defined(kSnapshotDataAsmSymbol)
++			const char* s_first = kSnapshotDataAsmSymbol;
++#else
+ 			const char* s_first = kVmSnapshotDataAsmSymbol;
+-			const char* s_last = s_first + strlen(kVmSnapshotDataAsmSymbol) + 1;
++#endif
++			const char* s_last = s_first + strlen(s_first) + 1;
+ 			//if (memmem(strtab, section->s_size, kVmSnapshotDataAsmSymbol, strlen(kVmSnapshotDataAsmSymbol))) {
+ 			if (std::search(strtab, last, s_first, s_last) != last) {
+ 				// found it
+@@ -104,6 +108,9 @@ LibAppInfo ElfHelper::findSnapshots(const uint8_t* elf)
+ 			break;
+ 	}
+ 
++	if (dynsym == nullptr || dynstr == nullptr)
++		throw std::invalid_argument("ELF: Cannot find Dart snapshot symbol table");
++
+ 	// find the required symbol addresses
+ 	const uint8_t* vm_snapshot_data = nullptr;
+ 	const uint8_t* vm_snapshot_instructions = nullptr;
+@@ -114,25 +121,41 @@ LibAppInfo ElfHelper::findSnapshots(const uint8_t* elf)
+ 			continue;
+ 
+ 		const char* name = dynstr + dynsym->name;
+-		// Note: sym_size is no needed for dart VM (its blob contains size)
++		// Convert the virtual symbol address to an offset in the mapped file.
++		const auto* sections = (const SectionHeader*)(elf + hdr->section_table_offset);
++		if (dynsym->section >= sh_num)
++			continue;
++		const auto& owner = sections[dynsym->section];
++		const auto* address = elf + (owner.file_offset + dynsym->value - owner.memory_offset);
++#if defined(kSnapshotDataAsmSymbol)
++		if (strcmp(name, kSnapshotDataAsmSymbol) == 0) {
++			isolate_snapshot_data = address;
++		}
++		else if (strcmp(name, kSnapshotTextAsmSymbol) == 0) {
++			isolate_snapshot_instructions = address;
++		}
++#else
+ 		if (strcmp(name, kVmSnapshotDataAsmSymbol) == 0) {
+-			vm_snapshot_data = elf + dynsym->value;
++			vm_snapshot_data = address;
+ 		}
+ 		else if (strcmp(name, kVmSnapshotInstructionsAsmSymbol) == 0) {
+-			vm_snapshot_instructions = elf + dynsym->value;
++			vm_snapshot_instructions = address;
+ 		}
+ 		else if (strcmp(name, kIsolateSnapshotDataAsmSymbol) == 0) {
+-			isolate_snapshot_data = elf + dynsym->value;
++			isolate_snapshot_data = address;
+ 		}
+ 		else if (strcmp(name, kIsolateSnapshotInstructionsAsmSymbol) == 0) {
+-			isolate_snapshot_instructions = elf + dynsym->value;
++			isolate_snapshot_instructions = address;
+ 		}
++#endif
+ 	}
+ 
++#if !defined(kSnapshotDataAsmSymbol)
+ 	if (vm_snapshot_data == nullptr)
+ 		throw std::invalid_argument("ELF: Cannot find Dart VM Snapshot Data");
+ 	if (vm_snapshot_instructions == nullptr)
+ 		throw std::invalid_argument("ELF: Cannot find Dart VM Snapshot Instructions");
++#endif
+ 	if (isolate_snapshot_data == nullptr)
+ 		throw std::invalid_argument("ELF: Cannot find Dart Isolate Snapshot Data");
+ 	if (isolate_snapshot_instructions == nullptr)
+diff --git a/blutter/src/FridaWriter.cpp b/blutter/src/FridaWriter.cpp
+index 405f9c6..0f4be96 100644
+--- a/blutter/src/FridaWriter.cpp
++++ b/blutter/src/FridaWriter.cpp
+@@ -115,7 +115,9 @@ void FridaWriter::Create(const char* filename)
+ 				of << "{id:" << dartCls->Id() << ",";
+ 				of << "name:\"Closure\",";
+ 				of << "fnOffset:" << AOT_Closure_function_offset << ",";
++#if !defined(kSnapshotDataAsmSymbol)
+ 				of << "contextOffset:" << AOT_Closure_context_offset << ",";
++#endif
+ 				of << "epOffset:" << AOT_Closure_entry_point_offset << "},\n";
+ 				break;
+ 			case dart::kTypedDataUint8ArrayCid:
+diff --git a/extract_dart_info.py b/extract_dart_info.py
+index 60e4cf2..d8f55ca 100644
+--- a/extract_dart_info.py
++++ b/extract_dart_info.py
+@@ -15,15 +15,31 @@ from elftools.elf.sections import SymbolTableSection
+ def extract_snapshot_hash_flags(libapp_file):
+     with open(libapp_file, 'rb') as f:
+         elf = ELFFile(f)
+-        # find "_kDartVmSnapshotData" symbol
++        # Dart 3.14+ has one program snapshot instead of VM/isolate snapshots.
+         dynsym = elf.get_section_by_name('.dynsym')
+-        sym = dynsym.get_symbol_by_name('_kDartVmSnapshotData')[0]
+-        #section = elf.get_section(sym['st_shndx'])
+-        assert sym['st_size'] > 128
+-        f.seek(sym['st_value']+20)
+-        snapshot_hash = f.read(32).decode()
+-        data = f.read(256) # should be enough
+-        flags = data[:data.index(b'\0')].decode().strip().split(' ')
++        if dynsym is None:
++            raise ValueError('libapp.so has no dynamic symbol table')
++        symbols = (dynsym.get_symbol_by_name('_kDartSnapshotData') or
++                   dynsym.get_symbol_by_name('_kDartVmSnapshotData'))
++        if not symbols:
++            raise ValueError('Cannot find Dart snapshot data in libapp.so')
++        sym = symbols[0]
++        section = elf.get_section(sym['st_shndx'])
++        # ELF symbol values are virtual addresses, not necessarily file offsets.
++        offset = section['sh_offset'] + sym['st_value'] - section['sh_addr']
++        if sym['st_size'] < 53:
++            raise ValueError('Dart snapshot data is too small')
++        f.seek(offset)
++        header = f.read(52)
++        if header[:4] != b'\xf5\xf5\xdc\xdc':
++            raise ValueError('Invalid Dart snapshot magic')
++        snapshot_hash = header[20:52].decode('ascii')
++        if re.fullmatch(r'[a-f0-9]{32}', snapshot_hash) is None:
++            raise ValueError('Invalid Dart snapshot hash')
++        data = f.read(min(sym['st_size'] - 52, 4096))
++        if b'\0' not in data:
++            raise ValueError('Unterminated Dart snapshot flags')
++        flags = data.split(b'\0', 1)[0].decode('ascii').split()
+     
+     return snapshot_hash, flags
+ 
+@@ -32,7 +48,7 @@ def extract_libflutter_info(libflutter_file):
+         elf = ELFFile(f)
+         if elf.header.e_machine == 'EM_AARCH64': # 183
+             arch = 'arm64'
+-        elif elf.header.e_machine == 'EM_IA_64': # 50
++        elif elf.header.e_machine == 'EM_X86_64': # 62
+             arch = 'x64'
+         else:
+             assert False, f"Unsupport architecture: {elf.header.e_machine}"
+@@ -44,7 +60,6 @@ def extract_libflutter_info(libflutter_file):
+         #print(sha_hashes)
+         # all possible engine ids
+         engine_ids = [ h.decode() for h in sha_hashes ]
+-        assert len(engine_ids) == 2, f'found hashes {", ".join(engine_ids)}'
+         
+         # beta/dev version of flutter might not use stable dart version (we can get dart version from sdk with found engine_id)
+         # support stable, beta and dev channels
+@@ -111,12 +126,18 @@ def extract_dart_info(libapp_file: str, libflutter_file: str):
+     # print('dart version', dart_version)
+ 
+     if dart_version is None:
++        if not engine_ids:
++            raise ValueError('Cannot detect Dart version or Flutter engine revision')
+         engine_id, sdk_url, sdk_size = get_dart_sdk_url_size(engine_ids)
+         # print(engine_id)
+         # print(sdk_url)
+         # print(sdk_size)
+ 
++        if sdk_url is None:
++            raise ValueError('Cannot locate Dart SDK for this Flutter engine')
+         commit_id, dart_version = get_dart_commit(sdk_url)
++        if dart_version is None:
++            raise ValueError('Cannot read Dart version from the engine SDK')
+         # print(commit_id)
+         # print(dart_version)
+         #assert dart_version == dart_version_sdk

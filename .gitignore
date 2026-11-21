@@ -1,3 +1,5 @@
 blutter/
 out/
 *.apk
+__pycache__/
+*.py[cod]

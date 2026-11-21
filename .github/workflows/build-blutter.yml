@@ -1,69 +1,58 @@
 name: Build & Analyze with blutter
 
-# 触发方式：手动 (Actions 页面 "Run workflow")，或 push 到 main
 on:
   workflow_dispatch:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
+  targets:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Discover target directories
+        id: targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "matrix=$(python3 scripts/blutter_ci.py discover)" >> "$GITHUB_OUTPUT"
+
   blutter:
-    runs-on: ubuntu-latest
+    needs: targets
+    runs-on: ubuntu-24.04
     timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
-        # 可同时跑多个标签；红桃视频 Dart 3.8.1
-        target: [yunhu_dart3140]
-
+        target: ${{ fromJSON(needs.targets.outputs.matrix) }}
     env:
-      TARGET_DESC: ${{ matrix.target }}
-
+      TARGET: ${{ matrix.target }}
+      PYTHONUNBUFFERED: '1'
     steps:
-      - name: Checkout repo (包含 libapp.so + libflutter.so)
-        uses: actions/checkout@v4
-
-      - name: 安装构建依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            git cmake ninja-build build-essential pkg-config \
-            libicu-dev libcapstone-dev python3 python3-pyelftools \
-            python3-requests python3-pip
-          cmake --version
-          gcc --version | head -1
-
-      - name: Clone blutter 源码
-        run: |
-          git clone --depth 1 https://github.com/worawit/blutter.git
-          cd blutter
-          # 首次进入会 clone dart-lang/sdk(3.6.2) 并编译 Dart VM，耗时长
-          ls blutter.py dartvm_fetch_build.py
-
-      - name: 运行 blutter 分析 libapp.so
-        working-directory: blutter
-        run: |
-          # 目标目录: repo 根/targets/<matrix.target>/ 下放 lib/arm64-v8a/{libapp.so,libflutter.so}
-          INDIR="$GITHUB_WORKSPACE/targets/${{ matrix.target }}/lib/arm64-v8a"
-          OUTDIR="$GITHUB_WORKSPACE/out/${{ matrix.target }}"
-          ls -la "$INDIR"
-          # 必须先建输出目录，blutter 不会自己创建多级父目录
-          mkdir -p "$OUTDIR"
-          python3 blutter.py "$INDIR" "$OUTDIR"
-
-      - name: 上传分析产物 (pp.txt / objs.txt / asm / blutter_frida.js)
-        uses: actions/upload-artifact@v4
+      - name: Checkout targets and build scripts
+        uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-blutter
+      - name: Detect Dart version from target libraries
+        id: dart
+        run: python3 scripts/blutter_ci.py detect --target "$TARGET" --output-json "out/$TARGET/dart-info.json"
+      - name: Build and analyze libapp.so
+        run: python3 scripts/blutter_ci.py analyze --target "$TARGET"
+      - name: Upload analysis results and detected Dart metadata
+        uses: actions/upload-artifact@v6
         with:
           name: blutter-out-${{ matrix.target }}
-          path: |
-            out/${{ matrix.target }}/
+          path: out/${{ matrix.target }}/
           if-no-files-found: error
-
-      - name: 上传编译好的 dartvm + blutter 可执行 (便于复用,不用每次重编)
-        uses: actions/upload-artifact@v4
+      - name: Upload compiled Dart VM and blutter
+        uses: actions/upload-artifact@v6
         with:
-          name: blutter-bin-${{ matrix.target }}
+          name: blutter-bin-${{ matrix.target }}-dart${{ steps.dart.outputs.dart_version }}
           path: |
             blutter/bin/
             blutter/packages/
-          if-no-files-found: warn
+          if-no-files-found: error

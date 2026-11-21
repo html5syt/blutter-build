@@ -1,0 +1,28 @@
+name: Set up patched blutter
+description: Install Linux build dependencies and checkout the tested upstream revision
+runs:
+  using: composite
+  steps:
+    - name: Install build dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          git cmake ninja-build build-essential pkg-config \
+          libicu-dev libcapstone-dev python3 python3-pyelftools python3-requests
+        cmake --version
+        gcc --version
+    - name: Checkout blutter and apply compatibility patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        REVISION=$(python3 -c "import sys; sys.path.insert(0, 'scripts'); from blutter_ci import UPSTREAM_REVISION; print(UPSTREAM_REVISION)")
+        git init blutter
+        git -C blutter remote add origin https://github.com/worawit/blutter.git
+        git -C blutter fetch --depth 1 origin "$REVISION"
+        git -C blutter checkout --detach FETCH_HEAD
+        python3 scripts/blutter_ci.py patch
+    - name: Run compatibility regression tests
+      shell: bash
+      run: python3 -m unittest discover -s tests -v
